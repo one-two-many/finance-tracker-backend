@@ -335,7 +335,7 @@ async def create_splitwise_expenses(
                 description=txn.description,
                 amount=txn.amount,
                 currency=txn.account.currency or "USD",
-                date=txn.transaction_date,
+                date=datetime.utcnow(),
                 split_type=request.split_type,
                 participants=scaled_participants,
                 notes=txn.notes,

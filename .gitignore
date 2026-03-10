@@ -11,6 +11,7 @@ build/
 dist/
 *.egg-info/
 .ft-env/*
+.ft/*
 
 # Environment
 .env
@@ -35,3 +36,4 @@ htmlcov/
 
 # statements
 /statements*
+
