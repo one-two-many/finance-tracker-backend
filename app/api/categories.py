@@ -3,6 +3,7 @@ Category and category rules API endpoints.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from typing import List
 from pydantic import BaseModel
 
@@ -21,6 +22,8 @@ class CategoryResponse(BaseModel):
     name: str
     color: str
     icon: str
+    is_global: bool = False
+    user_id: int
 
     class Config:
         from_attributes = True
@@ -30,6 +33,7 @@ class CategoryCreate(BaseModel):
     name: str
     color: str = "#6366f1"
     icon: str = "💰"
+    is_global: bool = False
 
 
 class CategoryUpdate(BaseModel):
@@ -78,7 +82,7 @@ async def list_categories(
     """
     categories = (
         db.query(Category)
-        .filter(Category.user_id == current_user.id)
+        .filter(or_(Category.user_id == current_user.id, Category.is_global == True))
         .order_by(Category.name)
         .all()
     )
@@ -102,10 +106,18 @@ async def create_category(
         CategoryResponse: Created category
     """
     # Check if category with same name already exists
-    existing = db.query(Category).filter(
-        Category.user_id == current_user.id,
-        Category.name == category_data.name
-    ).first()
+    if category_data.is_global:
+        # Global categories must be unique among all global categories
+        existing = db.query(Category).filter(
+            Category.is_global == True,
+            Category.name == category_data.name
+        ).first()
+    else:
+        # Personal categories must be unique per user
+        existing = db.query(Category).filter(
+            Category.user_id == current_user.id,
+            Category.name == category_data.name
+        ).first()
 
     if existing:
         raise HTTPException(
@@ -118,7 +130,8 @@ async def create_category(
         user_id=current_user.id,
         name=category_data.name,
         color=category_data.color,
-        icon=category_data.icon
+        icon=category_data.icon,
+        is_global=category_data.is_global
     )
 
     db.add(category)
@@ -159,10 +172,19 @@ async def update_category(
 
     # Check for name conflicts if name is being changed
     if category_data.name and category_data.name != category.name:
-        existing = db.query(Category).filter(
-            Category.user_id == current_user.id,
-            Category.name == category_data.name
-        ).first()
+        if category.is_global:
+            # Global categories must be unique among all global categories
+            existing = db.query(Category).filter(
+                Category.is_global == True,
+                Category.name == category_data.name,
+                Category.id != category.id
+            ).first()
+        else:
+            # Personal categories must be unique per user
+            existing = db.query(Category).filter(
+                Category.user_id == current_user.id,
+                Category.name == category_data.name
+            ).first()
 
         if existing:
             raise HTTPException(
@@ -288,10 +310,10 @@ async def create_category_rule(
     Returns:
         CategoryRuleResponse: Created rule
     """
-    # Verify category exists and belongs to user
+    # Verify category exists and belongs to user or is global
     category = db.query(Category).filter(
         Category.id == rule_data.category_id,
-        Category.user_id == current_user.id
+        or_(Category.user_id == current_user.id, Category.is_global == True)
     ).first()
 
     if not category:

@@ -2,9 +2,8 @@ name: Build and Push Backend Docker Image
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+    branches:
+      - master
 
 env:
   REGISTRY: ghcr.io

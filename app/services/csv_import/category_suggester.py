@@ -4,6 +4,7 @@ Category suggestion service for auto-categorizing transactions.
 import re
 from typing import Optional, List, Tuple
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from app.models.category import Category
 from app.models.category_rule import CategoryRule, PatternType
@@ -85,14 +86,16 @@ class CategorySuggester:
             )
 
     def _load_user_categories(self):
-        """Load and cache user's categories."""
+        """Load and cache user's categories (including global ones)."""
         if self._user_categories is None:
             categories = (
                 self.db.query(Category)
-                .filter(Category.user_id == self.user_id)
+                .filter(or_(Category.user_id == self.user_id, Category.is_global == True))
+                .order_by(Category.is_global.desc(), Category.name)
                 .all()
             )
             # Create lookup dict by lowercase name
+            # Global categories load first, user's own categories overwrite them
             self._user_categories = {
                 cat.name.lower(): cat for cat in categories
             }
