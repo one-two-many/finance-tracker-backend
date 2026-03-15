@@ -28,8 +28,8 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 async def list_transactions(
     start_date: Optional[str] = Query(None, description="Start date filter (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="End date filter (YYYY-MM-DD)"),
-    account_id: Optional[int] = Query(None, description="Filter by account ID"),
-    category_id: Optional[int] = Query(None, description="Filter by category ID"),
+    account_id: Optional[str] = Query(None, description="Filter by account ID(s), comma-separated for multiple"),
+    category_id: Optional[str] = Query(None, description="Filter by category ID(s), comma-separated for multiple"),
     transaction_type: Optional[str] = Query(None, description="Filter by type (income/expense/transfer)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -71,10 +71,18 @@ async def list_transactions(
             )
 
     if account_id:
-        query = query.filter(Transaction.account_id == account_id)
+        account_ids = [int(x.strip()) for x in account_id.split(",") if x.strip()]
+        if len(account_ids) == 1:
+            query = query.filter(Transaction.account_id == account_ids[0])
+        elif account_ids:
+            query = query.filter(Transaction.account_id.in_(account_ids))
 
     if category_id:
-        query = query.filter(Transaction.category_id == category_id)
+        category_ids = [int(x.strip()) for x in category_id.split(",") if x.strip()]
+        if len(category_ids) == 1:
+            query = query.filter(Transaction.category_id == category_ids[0])
+        elif category_ids:
+            query = query.filter(Transaction.category_id.in_(category_ids))
 
     if transaction_type:
         query = query.filter(Transaction.transaction_type == transaction_type)
@@ -153,6 +161,7 @@ async def delete_transaction(
 
 class TransactionUpdate(BaseModel):
     category_id: Optional[int] = None
+    transaction_type: Optional[str] = None
 
 
 @router.patch("/{transaction_id}")
@@ -162,7 +171,7 @@ async def update_transaction(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update mutable fields on a transaction (currently: category_id)."""
+    """Update mutable fields on a transaction (category_id, transaction_type)."""
     transaction = db.query(Transaction).filter(
         Transaction.id == transaction_id,
         Transaction.user_id == current_user.id
@@ -174,8 +183,17 @@ async def update_transaction(
             detail="Transaction not found"
         )
 
-    # Allow explicitly setting category_id to None (clear category)
-    transaction.category_id = body.category_id
+    if body.transaction_type is not None:
+        if body.transaction_type not in ("income", "expense", "transfer"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="transaction_type must be one of: income, expense, transfer"
+            )
+        transaction.transaction_type = body.transaction_type
+
+    if "category_id" in body.model_fields_set:
+        transaction.category_id = body.category_id
+
     db.commit()
     db.refresh(transaction)
 
@@ -185,6 +203,7 @@ async def update_transaction(
         "category_id": transaction.category_id,
         "category_name": category.name if category else None,
         "category_color": category.color if category else None,
+        "transaction_type": transaction.transaction_type,
     }
 
 
