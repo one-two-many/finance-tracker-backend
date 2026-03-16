@@ -298,7 +298,18 @@ async def create_splitwise_expenses(
         )
 
     # Group all selected transactions into ONE Splitwise expense
+    # Sum raw amounts — negatives (expenses) offset positives (refunds/credits)
     total_amount = sum(float(t.amount) for t in transactions)
+
+    # If net total is zero or positive, there's nothing to split
+    if total_amount >= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Net amount is zero or positive — nothing to split"
+        )
+
+    # Splitwise expects positive cost
+    total_amount = abs(total_amount)
 
     # Use custom description from request, or fall back to joined descriptions
     expense_description = request.description
