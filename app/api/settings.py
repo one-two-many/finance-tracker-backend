@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
+from decimal import Decimal
 
 from app.core.database import get_db
 from app.api.dependencies import get_current_user
@@ -70,6 +71,7 @@ class SplitwiseExpenseCreate(BaseModel):
     split_type: str  # "equal", "exact", "percent"
     participants: List[dict]  # [{"user_id": 123, "owed_share": 25.00}]
     group_id: Optional[int] = None
+    description: Optional[str] = None  # Custom expense name (defaults to category or descriptions)
 
 
 # API Endpoints
@@ -295,75 +297,87 @@ async def create_splitwise_expenses(
             status_code=500, detail=f"Failed to get Splitwise user info: {str(e)}"
         )
 
-    # The frontend calculates owed_shares based on the TOTAL of all selected
-    # transactions, but we create one expense per transaction.  We scale each
-    # friend's share proportionally to the individual transaction amount.
-    total_all_txns = sum(float(t.amount) for t in transactions)
+    # Group all selected transactions into ONE Splitwise expense
+    total_amount = sum(float(t.amount) for t in transactions)
 
-    # Create expenses on Splitwise
-    results = []
+    # Use custom description from request, or fall back to joined descriptions
+    expense_description = request.description
+    if not expense_description:
+        expense_description = "; ".join(t.description for t in transactions)
+
+    # Build notes from individual transaction details
+    notes_parts = []
     for txn in transactions:
-        txn_amount = float(txn.amount)
+        notes_parts.append(f"{txn.description}: ${float(txn.amount):.2f}")
+    expense_notes = "\n".join(notes_parts)
 
-        # Scale each friend's owed_share to this transaction's cost.
-        # Skip the current user if they appear in the list (e.g. as a group member)
-        # — they are always added explicitly below with the correct paid_share.
-        friends_owed_sum = 0.0
-        scaled_participants = []
-        for p in request.participants:
-            if p["user_id"] == sw_user_id:
-                continue
-            ratio = float(p["owed_share"]) / total_all_txns if total_all_txns else 0
-            friend_owed = round(txn_amount * ratio, 2)
-            friends_owed_sum += friend_owed
-            scaled_participants.append({
-                "user_id": p["user_id"],
-                "owed_share": friend_owed,
-                "paid_share": 0,
-            })
+    # Currency from first transaction's account
+    currency = transactions[0].account.currency or "USD"
 
-        # Current user pays the full cost and owes the remainder
-        current_user_owed = round(txn_amount - friends_owed_sum, 2)
-        scaled_participants.append({
-            "user_id": sw_user_id,
-            "owed_share": current_user_owed,
-            "paid_share": txn_amount,
+    # Build participants — skip current user from request list, add them explicitly
+    friends_owed_sum = 0.0
+    final_participants = []
+    for p in request.participants:
+        if p["user_id"] == sw_user_id:
+            continue
+        owed = round(float(p["owed_share"]), 2)
+        friends_owed_sum += owed
+        final_participants.append({
+            "user_id": p["user_id"],
+            "owed_share": owed,
+            "paid_share": 0,
         })
 
-        try:
-            expense_result = service.create_expense(
-                description=txn.description,
-                amount=txn.amount,
-                currency=txn.account.currency or "USD",
-                date=datetime.utcnow(),
-                split_type=request.split_type,
-                participants=scaled_participants,
-                notes=txn.notes,
-                group_id=request.group_id,
-            )
-            # Mark the transaction as split in our DB
+    # Current user pays the full cost and owes the remainder
+    current_user_owed = round(total_amount - friends_owed_sum, 2)
+    final_participants.append({
+        "user_id": sw_user_id,
+        "owed_share": current_user_owed,
+        "paid_share": total_amount,
+    })
+
+    try:
+        expense_result = service.create_expense(
+            description=expense_description,
+            amount=Decimal(str(total_amount)),
+            currency=currency,
+            date=datetime.utcnow(),
+            split_type=request.split_type,
+            participants=final_participants,
+            notes=expense_notes,
+            group_id=request.group_id,
+        )
+
+        # Mark all transactions as split in our DB
+        for txn in transactions:
             txn.splitwise_split = True
-            db.commit()
+        db.commit()
 
-            results.append(
-                {
-                    "transaction_id": txn.id,
-                    "status": "success",
-                    "splitwise_id": expense_result["id"],
-                    "url": expense_result["url"],
-                }
-            )
-        except Exception as e:
-            # Extract the most human-readable message available
-            error_msg = str(e)
-            results.append(
-                {"transaction_id": txn.id, "status": "error", "error": error_msg}
-            )
+        results = [
+            {
+                "transaction_id": txn.id,
+                "status": "success",
+                "splitwise_id": expense_result["id"],
+                "url": expense_result["url"],
+            }
+            for txn in transactions
+        ]
 
-    # Return summary
-    return {
-        "total": len(transactions),
-        "successful": len([r for r in results if r["status"] == "success"]),
-        "failed": len([r for r in results if r["status"] == "error"]),
-        "results": results,
-    }
+        return {
+            "total": len(transactions),
+            "successful": len(transactions),
+            "failed": 0,
+            "results": results,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        results = [
+            {"transaction_id": txn.id, "status": "error", "error": error_msg}
+            for txn in transactions
+        ]
+        return {
+            "total": len(transactions),
+            "successful": 0,
+            "failed": len(transactions),
+            "results": results,
+        }

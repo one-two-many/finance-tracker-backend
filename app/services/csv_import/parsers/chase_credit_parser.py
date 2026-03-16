@@ -116,9 +116,8 @@ class ChaseCreditParser(CSVParser):
                 # Parse date (MM/DD/YYYY)
                 transaction_date = parse_date(date_str, "%m/%d/%Y")
 
-                # Parse amount
+                # Parse amount — preserve the sign from the CSV
                 amount_value = parse_amount(amount_str)
-                amount_abs = abs(amount_value)
                 desc_lower = description.lower()
                 chase_type_lower = chase_type.lower()
 
@@ -150,13 +149,13 @@ class ChaseCreditParser(CSVParser):
                 # Create parsed transaction
                 transaction = ParsedTransaction(
                     date=transaction_date,
-                    amount=amount_abs,
+                    amount=amount_value,
                     description=description,
                     transaction_type=transaction_type,
                     category=category_name if category_name else None,
                     notes=notes,
                     raw_data=dict(row),
-                    original_amount=amount_value  # Preserve original signed amount from CSV
+                    original_amount=amount_value
                 )
 
                 transactions.append(transaction)
