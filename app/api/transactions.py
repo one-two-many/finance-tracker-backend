@@ -10,7 +10,7 @@ from app.api.dependencies import get_current_user
 from app.models.user import User
 from app.models.account import Account
 from app.models.import_session import ImportSession
-from app.models.transaction import Transaction
+from app.models.transaction import Transaction, TransactionType
 from app.models.category import Category
 from app.models.account_balance_snapshot import AccountBalanceSnapshot
 from app.schemas.csv_import import CSVImportResponse
@@ -162,6 +162,96 @@ async def delete_transaction(
 class TransactionUpdate(BaseModel):
     category_id: Optional[int] = None
     transaction_type: Optional[str] = None
+
+
+class MergeTransactionsRequest(BaseModel):
+    transaction_ids: List[int]
+    primary_id: Optional[int] = None
+
+
+@router.post("/merge")
+async def merge_transactions(
+    body: MergeTransactionsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Merge multiple transactions into one.
+
+    Keeps the earliest transaction (by date), calculates the net amount
+    (income as positive, expense/transfer as negative), updates the kept
+    transaction, and deletes the rest.
+    """
+    if len(body.transaction_ids) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least 2 transaction IDs are required to merge"
+        )
+
+    transactions = db.query(Transaction).filter(
+        Transaction.id.in_(body.transaction_ids),
+        Transaction.user_id == current_user.id
+    ).order_by(Transaction.transaction_date.asc()).all()
+
+    if len(transactions) != len(body.transaction_ids):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="One or more transactions not found"
+        )
+
+    # Use user-selected primary, or default to earliest by date
+    if body.primary_id:
+        primary = next((t for t in transactions if t.id == body.primary_id), None)
+        if not primary:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="primary_id must be one of the transaction_ids"
+            )
+    else:
+        primary = transactions[0]
+
+    # Calculate net: income = +amount, expense/transfer = -amount
+    net = 0.0
+    for txn in transactions:
+        if txn.transaction_type in ("income", TransactionType.INCOME):
+            net += float(txn.amount)
+        else:
+            net -= float(txn.amount)
+
+    # Update primary transaction with net result
+    if net >= 0:
+        primary.transaction_type = TransactionType.INCOME
+        primary.amount = round(net, 2)
+    else:
+        primary.transaction_type = TransactionType.EXPENSE
+        primary.amount = round(abs(net), 2)
+
+    # Delete the rest
+    deleted_ids = []
+    for txn in transactions[1:]:
+        deleted_ids.append(txn.id)
+        db.delete(txn)
+
+    db.commit()
+    db.refresh(primary)
+
+    account = db.query(Account).filter(Account.id == primary.account_id).first()
+    category = db.query(Category).filter(Category.id == primary.category_id).first() if primary.category_id else None
+
+    return {
+        "id": primary.id,
+        "account_id": primary.account_id,
+        "account_name": account.name if account else "Unknown",
+        "category_id": primary.category_id,
+        "category_name": category.name if category else None,
+        "category_color": category.color if category else None,
+        "transaction_type": primary.transaction_type.value if hasattr(primary.transaction_type, 'value') else primary.transaction_type,
+        "amount": float(primary.amount),
+        "description": primary.description,
+        "transaction_date": primary.transaction_date.isoformat(),
+        "merged_count": len(transactions),
+        "deleted_ids": deleted_ids
+    }
 
 
 @router.patch("/{transaction_id}")
