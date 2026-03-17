@@ -9,7 +9,7 @@ env:
   REGISTRY: ghcr.io
   # TODO: Replace with your actual GHCR image path
   # Format: ghcr.io/<github-username-or-org>/<image-name>
-  IMAGE: ghcr.io/AkshayShenvi/finance-tracker-backend
+  IMAGE: ghcr.io/one-two-many/finance-tracker-backend
 
 jobs:
   build:
