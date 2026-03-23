@@ -4,9 +4,15 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from decimal import Decimal
 
+from opentelemetry import trace
+
 from app.models.transaction import Transaction, TransactionType
 from app.models.account import Account
 from app.models.category import Category
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class SankeyService:
@@ -26,6 +32,13 @@ class SankeyService:
 
         Similar to the reference image with left (income), middle (cash flow), right (expenses + surplus)
         """
+        logger.info(
+            "sankey_generate_start",
+            user_id=user_id,
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+        )
+
         nodes = []
         links = []
         node_names = set()
@@ -166,6 +179,14 @@ class SankeyService:
                 "target": "Surplus",
                 "value": net_savings
             })
+
+        logger.info(
+            "sankey_generate_complete",
+            nodes_count=len(nodes),
+            links_count=len(links),
+            total_income=float(total_income),
+            total_expenses=float(total_expenses),
+        )
 
         return {
             "nodes": nodes,

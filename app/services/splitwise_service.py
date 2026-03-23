@@ -12,6 +12,13 @@ from typing import List, Dict, Optional
 from decimal import Decimal
 from datetime import datetime
 
+from opentelemetry import trace
+from app.core.logging import get_logger
+from app.core.telemetry import get_splitwise_expense_counter
+
+logger = get_logger(__name__)
+tracer = trace.get_tracer(__name__)
+
 
 class SplitwiseService:
     """Service for interacting with Splitwise API"""
@@ -127,6 +134,14 @@ class SplitwiseService:
         Raises:
             Exception: If expense creation fails
         """
+        logger.info(
+            "splitwise_create_expense_start",
+            description=description,
+            amount=str(amount),
+            split_type=split_type,
+            participants_count=len(participants),
+        )
+
         expense = Expense()
         expense.setCost(str(amount))
         expense.setDescription(description)
@@ -175,7 +190,19 @@ class SplitwiseService:
                     messages.extend([str(m) for m in value if m])
                 elif value:
                     messages.append(str(value))
-            raise Exception("; ".join(messages) if messages else "Splitwise returned an unknown error")
+            error_msg = "; ".join(messages) if messages else "Splitwise returned an unknown error"
+            logger.error("splitwise_create_expense_failed", error=error_msg)
+            raise Exception(error_msg)
+
+        try:
+            get_splitwise_expense_counter().add(1, {"status": "success"})
+        except Exception:
+            pass
+
+        logger.info(
+            "splitwise_create_expense_success",
+            expense_id=created_expense.getId(),
+        )
 
         return {
             "id": created_expense.getId(),

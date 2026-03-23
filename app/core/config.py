@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Finance Tracker"
     VERSION: str = "1.0.0"
 
+    # OpenTelemetry
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""
+    OTEL_SERVICE_NAME: str = "finance-tracker-backend"
+    OTEL_RESOURCE_ATTRIBUTES: str = ""
+    LOG_LEVEL: str = "INFO"
+    OTEL_ENABLED: bool = True
+
     @property
     def cors_origins(self) -> List[str]:
         return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",")]

@@ -5,16 +5,23 @@ from typing import Dict, List, Optional, Union
 from sqlalchemy.orm import Session
 from datetime import datetime
 
+from opentelemetry import trace
+
 from app.models.transaction import Transaction, TransactionType
 from app.models.category import Category
 from app.models.account import Account
 from app.models.account_balance_snapshot import AccountBalanceSnapshot
+from app.core.logging import get_logger
+from app.core.telemetry import get_csv_import_counter, get_csv_import_rows_histogram
 
 from .parser_registry import registry
 from .base_parser import ParsedTransaction
 from .legacy import is_duplicate, find_or_create_category
 from .category_suggester import CategorySuggester
 from .transfer_detector import TransferDetector
+
+logger = get_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class CSVImportService:
@@ -53,6 +60,8 @@ class CSVImportService:
         # Fetch account to get account type
         account = self.db.query(Account).filter(Account.id == account_id).first()
         account_type = account.account_type.value if account and account.account_type else None
+
+        logger.info("csv_preview_start", account_id=account_id, parser_name=parser_name)
 
         # Auto-detect parser if not specified
         if not parser_name:
@@ -188,6 +197,20 @@ class CSVImportService:
         Returns:
             Dict with import summary
         """
+        with tracer.start_as_current_span("csv_import", attributes={
+            "csv.parser": parser_name,
+            "csv.account_id": account_id,
+            "csv.skip_duplicates": skip_duplicates,
+        }) as span:
+            return self._do_import(
+                span, file_content, account_id, parser_name,
+                category_mappings, type_overrides, skip_duplicates, filename,
+            )
+
+    def _do_import(self, span, file_content, account_id, parser_name,
+                   category_mappings, type_overrides, skip_duplicates, filename):
+        logger.info("csv_import_start", parser=parser_name, account_id=account_id)
+
         # Fetch account to get account type
         account = self.db.query(Account).filter(Account.id == account_id).first()
         if not account:
@@ -201,6 +224,8 @@ class CSVImportService:
 
         # Parse transactions with account type
         parsed_transactions = parser.parse(file_content, account_type=account_type)
+
+        span.set_attribute("csv.total_rows", len(parsed_transactions))
 
         # Import transactions
         created_count = 0
@@ -323,6 +348,7 @@ class CSVImportService:
             self.db.commit()
         except Exception as e:
             self.db.rollback()
+            logger.error("csv_import_commit_failed", error=str(e), parser=parser_name)
             raise Exception(f"Failed to save transactions: {str(e)}")
 
         # Extract and save balance snapshots if parser supports it
@@ -342,7 +368,7 @@ class CSVImportService:
                         'end_date': balance_data['end_date'].isoformat() if balance_data.get('end_date') else None
                     }
             except Exception as e:
-                print(f"Error extracting balances: {e}")
+                logger.warning("balance_extraction_failed", error=str(e))
                 # Don't fail the import if balance extraction fails
 
         result = {
@@ -355,6 +381,28 @@ class CSVImportService:
 
         if balance_info:
             result['balance_info'] = balance_info
+
+        # Record metrics
+        try:
+            get_csv_import_counter().add(1, {"parser": parser_name, "status": "success"})
+            get_csv_import_rows_histogram().record(created_count, {"parser": parser_name})
+        except Exception:
+            pass
+
+        span.set_attributes({
+            "csv.created": created_count,
+            "csv.skipped": skipped_count,
+            "csv.errors": error_count,
+        })
+
+        logger.info(
+            "csv_import_complete",
+            parser=parser_name,
+            total=len(parsed_transactions),
+            created=created_count,
+            skipped=skipped_count,
+            errors=error_count,
+        )
 
         return result
 
@@ -431,5 +479,5 @@ class CSVImportService:
             self.db.commit()
         except Exception as e:
             self.db.rollback()
-            print(f"Error saving balance snapshots: {e}")
+            logger.warning("balance_snapshot_save_failed", error=str(e))
             # Don't raise - balance tracking is supplementary

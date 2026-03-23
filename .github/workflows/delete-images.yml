@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: bots-house/ghcr-delete-image-action@v1.1.0
         with:
-          owner: akshayshenvi
+          owner: one-two-many
           name: finance-tracker-backend
           token: ${{ secrets.GITHUB_TOKEN }}
           untagged-keep-latest: 15

@@ -9,7 +9,7 @@ engine = create_engine(
     connect_args=(
         {"check_same_thread": False} if "sqlite" in settings.FT_DATABASE_URL else {}
     ),
-    echo=settings.DEBUG,
+    echo=False,
 )
 
 # Session factory
