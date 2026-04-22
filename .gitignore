@@ -37,4 +37,5 @@ htmlcov/
 
 # statements
 /statements*
+/temp_data/*
 

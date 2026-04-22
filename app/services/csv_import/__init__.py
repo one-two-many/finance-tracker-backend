@@ -8,10 +8,10 @@ from .parser_registry import registry
 from .parsers import (
     AmexParser,
     DiscoverBankParser,
-    DiscoverSavingsParser,
     ChaseBankParser,
     ChaseBankPDFParser,
     ChaseCreditParser,
+    CapitalOneSavingsParser,
 )
 
 # Legacy imports for backwards compatibility
@@ -30,10 +30,10 @@ def initialize_parsers():
     parsers = [
         AmexParser(),
         DiscoverBankParser(),
-        DiscoverSavingsParser(),
         ChaseBankParser(),
         ChaseBankPDFParser(),
         ChaseCreditParser(),
+        CapitalOneSavingsParser(),
     ]
 
     for parser in parsers:

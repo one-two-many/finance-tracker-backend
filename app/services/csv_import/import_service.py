@@ -476,6 +476,29 @@ class CSVImportService:
             self.db.add(end_snapshot)
 
         try:
+            # Flush pending snapshot inserts so the priority query below sees them.
+            self.db.flush()
+            # Mirror the latest snapshot into Account.current_balance so legacy
+            # surfaces (Accounts page, dashboard total) stay in sync. Priority
+            # matches NetWorthService: newest date wins; manual > end > start on ties.
+            snaps = self.db.query(AccountBalanceSnapshot).filter(
+                AccountBalanceSnapshot.user_id == self.user_id,
+                AccountBalanceSnapshot.account_id == account_id,
+            ).all()
+            if snaps:
+                rank = {"manual": 0, "end": 1, "start": 2}
+                latest = max(
+                    snaps,
+                    key=lambda s: (s.snapshot_date, -rank.get((s.snapshot_type or "").lower(), 3)),
+                )
+                account = (
+                    self.db.query(Account)
+                    .filter(Account.id == account_id, Account.user_id == self.user_id)
+                    .first()
+                )
+                if account is not None:
+                    account.current_balance = latest.balance
+
             self.db.commit()
         except Exception as e:
             self.db.rollback()

@@ -6,7 +6,7 @@ from app.core.config import settings
 from app.core.database import engine, Base
 from app.core.telemetry import init_telemetry
 from app.core.logging import get_logger
-from app.api import health, auth, accounts, transactions, parsers, categories, analytics, settings as settings_api
+from app.api import health, auth, accounts, transactions, parsers, categories, analytics, settings as settings_api, net_worth
 
 logger = get_logger(__name__)
 
@@ -62,6 +62,7 @@ app.include_router(parsers.router, prefix="/api/v1/parsers", tags=["parsers"])
 app.include_router(categories.router, prefix="/api/v1/categories", tags=["categories"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["analytics"])
 app.include_router(settings_api.router, prefix="/api/v1/settings", tags=["settings"])
+app.include_router(net_worth.router, prefix="/api/v1")
 
 logger.info("app_started", version=settings.VERSION)
 
