@@ -24,3 +24,4 @@ class User(Base):
     category_rules = relationship("CategoryRule", back_populates="user", cascade="all, delete-orphan")
     parser_templates = relationship("BankParserTemplate", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("UserSettings", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    savings_goals = relationship("SavingsGoal", back_populates="user", cascade="all, delete-orphan")
