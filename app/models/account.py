@@ -21,6 +21,7 @@ class Account(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    household_id = Column(Integer, ForeignKey("households.id"), nullable=True, index=True)
     name = Column(String, nullable=False)
     account_type = Column(SQLEnum(AccountType), nullable=False)
     currency = Column(String(3), default="USD")
@@ -46,5 +47,10 @@ class Account(Base):
 
     # Relationships
     user = relationship("User", back_populates="accounts")
+    household = relationship("Household", back_populates="accounts")
     transactions = relationship("Transaction", foreign_keys="[Transaction.account_id]", back_populates="account", cascade="all, delete-orphan")
     rate_history = relationship("AccountRateHistory", back_populates="account", cascade="all, delete-orphan")
+
+    @property
+    def is_joint(self) -> bool:
+        return self.household_id is not None

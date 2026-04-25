@@ -13,8 +13,17 @@ from app.models.transaction import Transaction
 from app.models.category import Category
 from app.services.sankey_service import SankeyService
 from app.services.category_expenses_service import CategoryExpensesService
+from app.services import household_service
 
 router = APIRouter()
+
+
+def _resolve_scope_account_ids(db: Session, user_id: int, household_id: Optional[int]) -> list[int]:
+    """Resolve account-id set for analytics. Individual scope = visible accounts; household scope = all members' personal + joint accounts."""
+    if household_id is None:
+        return household_service.get_visible_account_ids(db, user_id)
+    household_service.assert_member(db, household_id, user_id)
+    return household_service.get_household_account_ids(db, household_id)
 
 
 @router.get("/sankey")
@@ -22,54 +31,61 @@ async def get_sankey_data(
     start_date: Optional[datetime] = Query(None, description="Start date for analysis"),
     end_date: Optional[datetime] = Query(None, description="End date for analysis"),
     include_transfers: bool = Query(False, description="Include account-to-account transfers"),
+    household_id: Optional[int] = Query(None, description="If set, scope to a household (combined across members + joint)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Get Sankey diagram data showing money flow:
-    Income Sources → Accounts → Expense Categories
-
-    Query Parameters:
-        - start_date: Start of analysis period (defaults to 30 days ago)
-        - end_date: End of analysis period (defaults to today)
-        - include_transfers: Include account-to-account transfers (default: False)
-
-    Returns:
-        Sankey diagram data with nodes, links, and summary statistics
+    Sankey cash flow. Default scope: caller's visible accounts (personal + any joint they can see).
+    With ``household_id``: combined across every member's personal + joint accounts.
     """
-    # Default to last 30 days if not provided
     if not end_date:
         end_date = datetime.utcnow()
     if not start_date:
         start_date = end_date - timedelta(days=30)
 
-    # Initialize service and generate data
+    account_ids = _resolve_scope_account_ids(db, current_user.id, household_id)
     sankey_service = SankeyService(db)
-    data = sankey_service.generate_sankey_data(
-        user_id=current_user.id,
+    return sankey_service.generate_sankey_data(
+        account_ids=account_ids,
         start_date=start_date,
         end_date=end_date,
-        include_transfers=include_transfers
+        include_transfers=include_transfers,
     )
-
-    return data
 
 
 @router.get("/dashboard")
 async def get_dashboard_summary(
+    household_id: Optional[int] = Query(None, description="If set, scope to a household (combined across members + joint)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Get dashboard summary statistics:
-    - Total balance across all accounts
-    - This month's income
-    - This month's expenses
-    - Recent transactions (last 10)
+    Dashboard summary: total balance, this month's income/expenses, recent 10 transactions.
+    Default scope: caller's visible accounts. With ``household_id``: full household scope.
     """
-    # Calculate total balance from all accounts
+    account_ids = _resolve_scope_account_ids(db, current_user.id, household_id)
+
+    if not account_ids:
+        empty_period_now = datetime.utcnow()
+        return {
+            "total_balance": 0.0,
+            "month_income": 0.0,
+            "month_expenses": 0.0,
+            "recent_transactions": [],
+            "period": {
+                "month_start": datetime(empty_period_now.year, empty_period_now.month, 1).isoformat(),
+                "month_end": (
+                    datetime(empty_period_now.year + 1, 1, 1)
+                    if empty_period_now.month == 12
+                    else datetime(empty_period_now.year, empty_period_now.month + 1, 1)
+                ).isoformat(),
+            },
+        }
+
+    # Total balance: sum of current_balance across visible accounts
     total_balance = db.query(func.sum(Account.current_balance)).filter(
-        Account.user_id == current_user.id
+        Account.id.in_(account_ids)
     ).scalar() or Decimal('0')
 
     # Get current month date range
@@ -83,7 +99,7 @@ async def get_dashboard_summary(
     # Calculate this month's income
     month_income = db.query(func.sum(Transaction.amount)).filter(
         and_(
-            Transaction.user_id == current_user.id,
+            Transaction.account_id.in_(account_ids),
             Transaction.transaction_type == 'income',
             Transaction.transaction_date >= month_start,
             Transaction.transaction_date < month_end
@@ -93,7 +109,7 @@ async def get_dashboard_summary(
     # Calculate this month's expenses
     month_expenses = db.query(func.sum(Transaction.amount)).filter(
         and_(
-            Transaction.user_id == current_user.id,
+            Transaction.account_id.in_(account_ids),
             Transaction.transaction_type == 'expense',
             Transaction.transaction_date >= month_start,
             Transaction.transaction_date < month_end
@@ -106,7 +122,7 @@ async def get_dashboard_summary(
     ).outerjoin(
         Category, Transaction.category_id == Category.id
     ).filter(
-        Transaction.user_id == current_user.id
+        Transaction.account_id.in_(account_ids)
     ).order_by(
         Transaction.transaction_date.desc(),
         Transaction.created_at.desc()
@@ -141,11 +157,13 @@ async def get_dashboard_summary(
 @router.get("/category-expenses-monthly")
 async def get_category_expenses_monthly(
     year: int = Query(..., description="Year to analyze"),
+    household_id: Optional[int] = Query(None, description="If set, scope to a household (combined across members + joint)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    account_ids = _resolve_scope_account_ids(db, current_user.id, household_id)
     service = CategoryExpensesService(db)
     return service.get_category_expenses_monthly(
-        user_id=current_user.id,
+        account_ids=account_ids,
         year=year,
     )

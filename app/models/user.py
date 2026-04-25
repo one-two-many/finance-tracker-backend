@@ -25,3 +25,18 @@ class User(Base):
     parser_templates = relationship("BankParserTemplate", back_populates="user", cascade="all, delete-orphan")
     settings = relationship("UserSettings", back_populates="user", uselist=False, cascade="all, delete-orphan")
     savings_goals = relationship("SavingsGoal", back_populates="user", cascade="all, delete-orphan")
+    household_memberships = relationship(
+        "HouseholdMember", back_populates="user", cascade="all, delete-orphan"
+    )
+    sent_invitations = relationship(
+        "HouseholdInvitation",
+        foreign_keys="[HouseholdInvitation.inviter_user_id]",
+        back_populates="inviter",
+        cascade="all, delete-orphan",
+    )
+    received_invitations = relationship(
+        "HouseholdInvitation",
+        foreign_keys="[HouseholdInvitation.invitee_user_id]",
+        back_populates="invitee",
+        cascade="all, delete-orphan",
+    )

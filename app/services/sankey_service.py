@@ -21,20 +21,18 @@ class SankeyService:
 
     def generate_sankey_data(
         self,
-        user_id: int,
+        account_ids: list[int],
         start_date: datetime,
         end_date: datetime,
         include_transfers: bool = False
     ) -> Dict:
         """
-        Generate Sankey diagram showing cash flow:
+        Generate Sankey diagram showing cash flow over the given account scope.
         Income Sources → Cash Flow (middle) → Expense Categories + Surplus
-
-        Similar to the reference image with left (income), middle (cash flow), right (expenses + surplus)
         """
         logger.info(
             "sankey_generate_start",
-            user_id=user_id,
+            account_count=len(account_ids),
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
         )
@@ -53,8 +51,22 @@ class SankeyService:
                 })
                 node_names.add(name)
 
-        # Get all accounts for the user (we'll use for middle layer)
-        accounts = self.db.query(Account).filter(Account.user_id == user_id).all()
+        if not account_ids:
+            return {
+                "nodes": [],
+                "links": [],
+                "summary": {
+                    "total_income": 0.0,
+                    "total_expenses": 0.0,
+                    "net_savings": 0.0,
+                    "period": {
+                        "start_date": start_date.isoformat(),
+                        "end_date": end_date.isoformat(),
+                    },
+                },
+            }
+
+        accounts = self.db.query(Account).filter(Account.id.in_(account_ids)).all()
         account_types = {acc.id: acc.account_type.value for acc in accounts}
 
         # Calculate total income (exclude credit card refunds)
@@ -64,7 +76,7 @@ class SankeyService:
             Account, Transaction.account_id == Account.id
         ).filter(
             and_(
-                Transaction.user_id == user_id,
+                Transaction.account_id.in_(account_ids),
                 Transaction.transaction_type == TransactionType.INCOME,
                 Transaction.transaction_date >= start_date,
                 Transaction.transaction_date <= end_date,
@@ -77,7 +89,7 @@ class SankeyService:
             func.sum(Transaction.amount)
         ).filter(
             and_(
-                Transaction.user_id == user_id,
+                Transaction.account_id.in_(account_ids),
                 Transaction.transaction_type == TransactionType.EXPENSE,
                 Transaction.transaction_date >= start_date,
                 Transaction.transaction_date <= end_date
@@ -94,7 +106,7 @@ class SankeyService:
             Account, Transaction.account_id == Account.id
         ).filter(
             and_(
-                Transaction.user_id == user_id,
+                Transaction.account_id.in_(account_ids),
                 Transaction.transaction_type == TransactionType.INCOME,
                 Transaction.transaction_date >= start_date,
                 Transaction.transaction_date <= end_date,
@@ -141,7 +153,7 @@ class SankeyService:
             func.sum(Transaction.amount).label("total")
         ).filter(
             and_(
-                Transaction.user_id == user_id,
+                Transaction.account_id.in_(account_ids),
                 Transaction.transaction_type == TransactionType.EXPENSE,
                 Transaction.transaction_date >= start_date,
                 Transaction.transaction_date <= end_date

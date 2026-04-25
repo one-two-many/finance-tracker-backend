@@ -1,20 +1,13 @@
 """
 Net Worth API router.
 
-Endpoints under ``/net-worth`` (mounted at ``/api/v1`` in ``app/main.py``):
-  - GET  /net-worth/current           → NetWorthCurrent
-  - GET  /net-worth/history           → List[NetWorthHistoryPoint]
-  - GET  /net-worth/goals             → List[SavingsGoalOut]
-  - POST /net-worth/goals             → SavingsGoalOut (201)
-  - PATCH /net-worth/goals/{goal_id}  → SavingsGoalOut
-  - DELETE /net-worth/goals/{goal_id} → {"message": "Goal deleted successfully"} (200)
-
-All endpoints require authentication via ``get_current_user`` and filter by
-``current_user.id``. Missing / wrong-owner resources return 404 so we do not
-leak resource existence.
+Endpoints under ``/net-worth`` (mounted at ``/api/v1`` in ``app/main.py``).
+``/current`` and ``/history`` accept an optional ``household_id`` query param —
+when set, results are aggregated across every member's personal + joint accounts.
 """
+from collections import defaultdict
 from decimal import Decimal
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -25,12 +18,16 @@ from app.models.account import Account
 from app.models.savings_goal import SavingsGoal
 from app.models.user import User
 from app.schemas.net_worth import (
+    AccountSummary,
+    AccountTypeTotal,
     NetWorthCurrent,
+    NetWorthDelta,
     NetWorthHistoryPoint,
     SavingsGoalCreate,
     SavingsGoalOut,
     SavingsGoalUpdate,
 )
+from app.services import household_service
 from app.services.net_worth_service import NetWorthService
 
 router = APIRouter(prefix="/net-worth", tags=["net-worth"])
@@ -93,35 +90,121 @@ def _account_owned_by(db: Session, account_id: int, user_id: int) -> bool:
     )
 
 
+def _aggregate_current_net_worth(per_member: List[NetWorthCurrent]) -> NetWorthCurrent:
+    """Combine multiple per-user NetWorthCurrent payloads into a single household payload."""
+    if not per_member:
+        return NetWorthCurrent(
+            total=Decimal("0"),
+            assets=Decimal("0"),
+            liabilities=Decimal("0"),
+            as_of=__import__("datetime").date.today(),
+            by_type=[],
+            delta=NetWorthDelta(),
+            sparkline=[],
+        )
+
+    total = sum((m.total for m in per_member), Decimal("0"))
+    assets = sum((m.assets for m in per_member), Decimal("0"))
+    liabilities = sum((m.liabilities for m in per_member), Decimal("0"))
+    as_of = max(m.as_of for m in per_member)
+
+    # Merge by account_type
+    type_buckets: dict[str, AccountTypeTotal] = {}
+    for m in per_member:
+        for bt in m.by_type:
+            existing = type_buckets.get(bt.account_type)
+            if existing is None:
+                type_buckets[bt.account_type] = AccountTypeTotal(
+                    account_type=bt.account_type,
+                    total=bt.total,
+                    is_liability=bt.is_liability,
+                    accounts=list(bt.accounts),
+                )
+            else:
+                existing.total += bt.total
+                existing.accounts.extend(bt.accounts)
+
+    # Aligned sparkline: pad shorter members with zeros at the front, sum element-wise
+    spark_len = max((len(m.sparkline) for m in per_member), default=0)
+    aggregated_sparkline: List[Decimal] = []
+    if spark_len:
+        padded = []
+        for m in per_member:
+            pad = [Decimal("0")] * (spark_len - len(m.sparkline))
+            padded.append(pad + list(m.sparkline))
+        for i in range(spark_len):
+            aggregated_sparkline.append(sum((row[i] for row in padded), Decimal("0")))
+
+    return NetWorthCurrent(
+        total=total,
+        assets=assets,
+        liabilities=liabilities,
+        as_of=as_of,
+        by_type=list(type_buckets.values()),
+        delta=NetWorthDelta(),  # household-level deltas are not computed in v1
+        sparkline=aggregated_sparkline,
+    )
+
+
+def _aggregate_history(per_member_histories: List[List[NetWorthHistoryPoint]]) -> List[NetWorthHistoryPoint]:
+    """Sum monthly histories across members on matching periods."""
+    by_period: dict[str, dict[str, Decimal]] = defaultdict(lambda: {"assets": Decimal("0"), "liabilities": Decimal("0"), "net": Decimal("0")})
+    for member_history in per_member_histories:
+        for point in member_history:
+            bucket = by_period[point.period]
+            bucket["assets"] += point.assets
+            bucket["liabilities"] += point.liabilities
+            bucket["net"] += point.net
+    return [
+        NetWorthHistoryPoint(period=p, assets=v["assets"], liabilities=v["liabilities"], net=v["net"])
+        for p, v in sorted(by_period.items())
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Net worth summary + history
 # ---------------------------------------------------------------------------
 
 @router.get("/current", response_model=NetWorthCurrent)
 async def get_current_net_worth(
+    household_id: Optional[int] = Query(None, description="If set, return combined networth across the household's members."),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Current net worth summary — total, breakdown by account type, MoM/YoY
-    deltas, and a 24-month sparkline. All data is filtered by user_id inside
-    the service.
+    Current net worth — total, breakdown by account type, MoM/YoY deltas, and a
+    24-month sparkline. Default scope: the caller. With ``household_id``: summed
+    across every member's personal + joint accounts.
     """
-    service = NetWorthService(db, current_user.id)
-    return service.get_current_net_worth()
+    if household_id is None:
+        service = NetWorthService(db, current_user.id)
+        return service.get_current_net_worth()
+
+    household_service.assert_member(db, household_id, current_user.id)
+    member_ids = household_service.get_household_member_user_ids(db, household_id)
+    per_member = [NetWorthService(db, uid).get_current_net_worth() for uid in member_ids]
+    return _aggregate_current_net_worth(per_member)
 
 
 @router.get("/history", response_model=List[NetWorthHistoryPoint])
 async def get_net_worth_history(
     months: int = Query(24, ge=1, le=60),
+    household_id: Optional[int] = Query(None, description="If set, return combined history across the household's members."),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Monthly net-worth time-series (oldest first). ``months`` must be in [1, 60].
+    Monthly net-worth time-series (oldest first). ``months`` in [1, 60]. With
+    ``household_id``, monthly points are summed across all members.
     """
-    service = NetWorthService(db, current_user.id)
-    return service.get_monthly_history(months=months)
+    if household_id is None:
+        service = NetWorthService(db, current_user.id)
+        return service.get_monthly_history(months=months)
+
+    household_service.assert_member(db, household_id, current_user.id)
+    member_ids = household_service.get_household_member_user_ids(db, household_id)
+    per_member = [NetWorthService(db, uid).get_monthly_history(months=months) for uid in member_ids]
+    return _aggregate_history(per_member)
 
 
 # ---------------------------------------------------------------------------

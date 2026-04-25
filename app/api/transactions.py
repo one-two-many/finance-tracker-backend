@@ -17,6 +17,7 @@ from app.schemas.csv_import import CSVImportResponse
 from app.schemas.parser import ImportPreviewResponse, ImportConfirmRequest, ImportConfirmResponse
 from app.services.csv_import import parse_amex_csv
 from app.services.csv_import.import_service import CSVImportService
+from app.services import household_service
 
 router = APIRouter()
 
@@ -47,7 +48,10 @@ async def list_transactions(
     Returns:
         List of transactions with account and category details
     """
-    query = db.query(Transaction).filter(Transaction.user_id == current_user.id)
+    visible_account_ids = household_service.get_visible_account_ids(db, current_user.id)
+    if not visible_account_ids:
+        return []
+    query = db.query(Transaction).filter(Transaction.account_id.in_(visible_account_ids))
 
     # Apply filters
     if start_date:
@@ -106,6 +110,7 @@ async def list_transactions(
             "id": txn.id,
             "account_id": txn.account_id,
             "account_name": account.name if account else "Unknown",
+            "account_household_id": account.household_id if account else None,
             "category_id": txn.category_id,
             "category_name": category.name if category else None,
             "category_color": category.color if category else None,
@@ -117,7 +122,8 @@ async def list_transactions(
             "created_at": txn.created_at.isoformat() if txn.created_at else None,
             "transfer_to_account_id": txn.transfer_to_account_id,
             "transfer_to_account_name": transfer_account_name,
-            "splitwise_split": txn.splitwise_split or False
+            "splitwise_split": txn.splitwise_split or False,
+            "user_id": txn.user_id,
         })
 
     return result
@@ -140,19 +146,13 @@ async def delete_transaction(
     Returns:
         Success message
     """
-    # Verify transaction ownership
-    transaction = db.query(Transaction).filter(
-        Transaction.id == transaction_id,
-        Transaction.user_id == current_user.id
-    ).first()
-
-    if not transaction:
+    transaction = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    if transaction is None or not household_service.can_modify_transaction(db, transaction, current_user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Transaction not found or you don't have permission to delete it"
         )
 
-    # Delete transaction
     db.delete(transaction)
     db.commit()
 
@@ -188,9 +188,10 @@ async def merge_transactions(
             detail="At least 2 transaction IDs are required to merge"
         )
 
+    visible_account_ids = household_service.get_visible_account_ids(db, current_user.id)
     transactions = db.query(Transaction).filter(
         Transaction.id.in_(body.transaction_ids),
-        Transaction.user_id == current_user.id
+        Transaction.account_id.in_(visible_account_ids) if visible_account_ids else False,
     ).order_by(Transaction.transaction_date.asc()).all()
 
     if len(transactions) != len(body.transaction_ids):
@@ -198,6 +199,13 @@ async def merge_transactions(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="One or more transactions not found"
         )
+
+    for txn in transactions:
+        if not household_service.can_modify_transaction(db, txn, current_user.id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to modify one of these transactions",
+            )
 
     # Use user-selected primary, or default to earliest by date
     if body.primary_id:
@@ -265,12 +273,8 @@ async def update_transaction(
     db: Session = Depends(get_db)
 ):
     """Update mutable fields on a transaction (category_id, transaction_type)."""
-    transaction = db.query(Transaction).filter(
-        Transaction.id == transaction_id,
-        Transaction.user_id == current_user.id
-    ).first()
-
-    if not transaction:
+    transaction = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    if transaction is None or not household_service.can_modify_transaction(db, transaction, current_user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Transaction not found"
@@ -348,13 +352,9 @@ async def import_csv(
             detail=f"Invalid file type: {file.content_type}. Must be CSV or PDF."
         )
 
-    # Verify account ownership
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == current_user.id
-    ).first()
-
-    if not account:
+    # Verify account access (joint accounts: any household member can import)
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Account not found or you don't have permission to access it"
@@ -448,13 +448,9 @@ async def preview_csv_import(
             detail="File must be a CSV (.csv) or PDF (.pdf) file"
         )
 
-    # Verify account ownership
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == current_user.id
-    ).first()
-
-    if not account:
+    # Verify account access (joint accounts: any household member can import)
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Account not found or you don't have permission to access it"
@@ -512,13 +508,9 @@ async def confirm_csv_import(
     Returns:
         ImportConfirmResponse: Import summary
     """
-    # Verify account ownership
-    account = db.query(Account).filter(
-        Account.id == request.account_id,
-        Account.user_id == current_user.id
-    ).first()
-
-    if not account:
+    # Verify account access (joint accounts: any household member can import)
+    account = db.query(Account).filter(Account.id == request.account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Account not found or you don't have permission to access it"
@@ -574,8 +566,11 @@ async def list_import_sessions(
     Returns:
         List of import sessions with statistics
     """
+    visible_account_ids = household_service.get_visible_account_ids(db, current_user.id)
+    if not visible_account_ids:
+        return []
     sessions = db.query(ImportSession).filter(
-        ImportSession.user_id == current_user.id
+        ImportSession.account_id.in_(visible_account_ids)
     ).order_by(ImportSession.created_at.desc()).all()
 
     result = []
@@ -613,17 +608,13 @@ async def get_import_session_transactions(
     Returns:
         List of transactions from the import session
     """
-    # Verify session ownership
-    session = db.query(ImportSession).filter(
-        ImportSession.id == session_id,
-        ImportSession.user_id == current_user.id
-    ).first()
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Import session not found"
-        )
+    # Verify session access (joint accounts: any household member can view)
+    session = db.query(ImportSession).filter(ImportSession.id == session_id).first()
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Import session not found")
+    session_account = db.query(Account).filter(Account.id == session.account_id).first()
+    if session_account is None or not household_service.can_view_account(db, session_account, current_user.id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Import session not found")
 
     # Get transactions
     transactions = db.query(Transaction).filter(
@@ -676,8 +667,11 @@ async def get_balance_snapshots(
     Returns:
         List of balance snapshots with account details
     """
+    visible_account_ids = household_service.get_visible_account_ids(db, current_user.id)
+    if not visible_account_ids:
+        return []
     query = db.query(AccountBalanceSnapshot).filter(
-        AccountBalanceSnapshot.user_id == current_user.id
+        AccountBalanceSnapshot.account_id.in_(visible_account_ids)
     )
 
     # Apply filters
