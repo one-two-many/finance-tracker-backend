@@ -15,7 +15,17 @@ class CategoryExpensesService:
     def __init__(self, db: Session):
         self.db = db
 
-    def get_category_expenses_monthly(self, user_id: int, year: int) -> Dict:
+    def get_category_expenses_monthly(self, account_ids: list[int], year: int) -> Dict:
+        if not account_ids:
+            return {
+                "year": year,
+                "categories": [],
+                "months": [
+                    {"month": m, "label": MONTH_LABELS[m - 1], "categories": {}, "total": 0.0}
+                    for m in range(1, 13)
+                ],
+                "grand_total": 0.0,
+            }
         rows = (
             self.db.query(
                 extract("month", Transaction.transaction_date).label("month"),
@@ -25,7 +35,7 @@ class CategoryExpensesService:
             .join(Account, Transaction.account_id == Account.id)
             .filter(
                 and_(
-                    Transaction.user_id == user_id,
+                    Transaction.account_id.in_(account_ids),
                     Transaction.transaction_type == TransactionType.EXPENSE,
                     extract("year", Transaction.transaction_date) == year,
                 )

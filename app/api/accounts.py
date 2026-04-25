@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func as sa_func
+from sqlalchemy import func as sa_func, or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Dict, List, Optional
@@ -11,6 +11,7 @@ from app.api.dependencies import get_current_user
 from app.models.user import User
 from app.models.account import Account, AccountType
 from app.models.account_balance_snapshot import AccountBalanceSnapshot
+from app.models.household import Household
 from app.models.transaction import Transaction, TransactionType
 from app.schemas.net_worth import (
     ManualBalanceUpdate,
@@ -24,7 +25,7 @@ from app.schemas.net_worth import (
     RateHistoryOut,
 )
 from app.services.csv_import.legacy import find_or_create_category
-from app.services import self_managed_service
+from app.services import self_managed_service, household_service
 
 router = APIRouter()
 
@@ -37,6 +38,7 @@ class AccountCreate(BaseModel):
     default_parser: Optional[str] = None
     bank_name: Optional[str] = None
     account_number_last4: Optional[str] = None
+    household_id: Optional[int] = None          # set when account is joint (shared with household)
     # CD + HYSA support
     interest_rate: Optional[Decimal] = None     # e.g. 0.0450 for 4.5% APR (HYSA: reference only; CD: used in accrual formula)
     maturity_date: Optional[date] = None        # CD only
@@ -68,6 +70,11 @@ class AccountResponse(BaseModel):
     # Self-managed → max(snapshot.snapshot_date); parser-backed → max(transaction.transaction_date).
     # Credit cards intentionally omitted (statement-driven, not balance-driven).
     balance_as_of_date: Optional[date] = None
+    # Household / shared-ownership info
+    household_id: Optional[int] = None
+    household_name: Optional[str] = None
+    creator_user_id: Optional[int] = None
+    creator_username: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -79,6 +86,7 @@ class AccountUpdate(BaseModel):
     default_parser: Optional[str] = None
     bank_name: Optional[str] = None
     account_number_last4: Optional[str] = None
+    household_id: Optional[int] = None          # change ownership: int = move to household, 0 = make personal
     # CD + HYSA support (all optional — None means "leave unchanged")
     interest_rate: Optional[Decimal] = None
     maturity_date: Optional[date] = None
@@ -88,6 +96,23 @@ class AccountUpdate(BaseModel):
 
     class Config:
         use_enum_values = True
+
+
+def _enrich_account_response(db: Session, account: Account, balance_as_of: Optional[date]) -> AccountResponse:
+    household_name = None
+    if account.household_id is not None:
+        h = db.query(Household).filter(Household.id == account.household_id).first()
+        household_name = h.name if h is not None else None
+    creator = db.query(User).filter(User.id == account.user_id).first()
+    return AccountResponse.model_validate(account).model_copy(
+        update={
+            "balance_as_of_date": balance_as_of,
+            "household_id": account.household_id,
+            "household_name": household_name,
+            "creator_user_id": account.user_id,
+            "creator_username": creator.username if creator is not None else None,
+        }
+    )
 
 
 @router.get("", response_model=List[AccountResponse])
@@ -107,7 +132,15 @@ async def get_accounts(
     # Keep self-managed balances current before we read them.
     self_managed_service.accrue_all_for_user(db, current_user.id)
 
-    accounts = db.query(Account).filter(Account.user_id == current_user.id).all()
+    household_ids = household_service.get_user_household_ids(db, current_user.id)
+    if household_ids:
+        accounts = (
+            db.query(Account)
+            .filter(or_(Account.user_id == current_user.id, Account.household_id.in_(household_ids)))
+            .all()
+        )
+    else:
+        accounts = db.query(Account).filter(Account.user_id == current_user.id).all()
 
     balance_as_of: Dict[int, Optional[date]] = {}
     if accounts:
@@ -148,12 +181,7 @@ async def get_accounts(
                 )
             balance_as_of[a.id] = as_of
 
-    return [
-        AccountResponse.model_validate(a).model_copy(
-            update={"balance_as_of_date": balance_as_of.get(a.id)}
-        )
-        for a in accounts
-    ]
+    return [_enrich_account_response(db, a, balance_as_of.get(a.id)) for a in accounts]
 
 
 @router.post("", response_model=AccountResponse, status_code=status.HTTP_201_CREATED)
@@ -172,9 +200,14 @@ async def create_account(
             detail="Currency code must be 3 characters (e.g., USD, EUR, GBP)"
         )
 
+    # If joint, verify the user is a member of the chosen household
+    if account_data.household_id is not None:
+        household_service.assert_member(db, account_data.household_id, current_user.id)
+
     # Create account
     db_account = Account(
         user_id=current_user.id,
+        household_id=account_data.household_id,
         name=account_data.name,
         account_type=account_data.account_type,
         currency=account_data.currency.upper(),
@@ -200,7 +233,7 @@ async def create_account(
     db.commit()
     db.refresh(db_account)
 
-    return db_account
+    return _enrich_account_response(db, db_account, None)
 
 
 @router.patch("/{account_id}", response_model=AccountResponse)
@@ -211,19 +244,14 @@ async def update_account(
     db: Session = Depends(get_db)
 ):
     """
-    Update an existing account for the authenticated user.
+    Update an existing account. Personal accounts may be edited by their owner; joint
+    accounts may be edited by any admin of the household.
     """
-    # Get account
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == current_user.id
-    ).first()
-
-    if not account:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Account not found or you don't have permission to access it"
-        )
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not household_service.can_modify_account(db, account, current_user.id):
+        raise HTTPException(status_code=403, detail="You don't have permission to modify this account")
 
     # Update fields
     if account_data.name is not None:
@@ -236,6 +264,13 @@ async def update_account(
         account.bank_name = account_data.bank_name
     if account_data.account_number_last4 is not None:
         account.account_number_last4 = account_data.account_number_last4
+    if "household_id" in account_data.model_fields_set:
+        new_hid = account_data.household_id
+        if new_hid in (None, 0):
+            account.household_id = None
+        else:
+            household_service.assert_admin(db, new_hid, current_user.id)
+            account.household_id = new_hid
     if account_data.interest_rate is not None:
         account.interest_rate = account_data.interest_rate
     if account_data.maturity_date is not None:
@@ -259,7 +294,7 @@ async def update_account(
     db.commit()
     db.refresh(account)
 
-    return account
+    return _enrich_account_response(db, account, None)
 
 
 @router.delete("/{account_id}")
@@ -269,22 +304,15 @@ async def delete_account(
     db: Session = Depends(get_db)
 ):
     """
-    Delete an account for the authenticated user.
-    Note: This will cascade delete all associated transactions.
+    Delete an account. Personal accounts: owner only. Joint accounts: admin of the household.
+    Cascade-deletes all associated transactions.
     """
-    # Get account
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == current_user.id
-    ).first()
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not household_service.can_modify_account(db, account, current_user.id):
+        raise HTTPException(status_code=403, detail="You don't have permission to delete this account")
 
-    if not account:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Account not found or you don't have permission to access it"
-        )
-
-    # Delete account (cascade will delete transactions)
     db.delete(account)
     db.commit()
 
@@ -306,13 +334,12 @@ async def update_account_balance(
 
     Returns 200 OK (upsert semantics).
     """
-    # Ownership check
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == current_user.id,
-    ).first()
-    if not account:
+    # Ownership check (joint accounts: admins only)
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
         raise HTTPException(status_code=404, detail="Account not found")
+    if not household_service.can_modify_account(db, account, current_user.id):
+        raise HTTPException(status_code=403, detail="You don't have permission to update this account's balance")
 
     # Validate interest_earned sign before any writes
     if payload.interest_earned is not None and payload.interest_earned < 0:
@@ -397,12 +424,11 @@ async def update_account_balance(
 def _require_self_managed(
     db: Session, account_id: int, user_id: int
 ) -> Account:
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == user_id,
-    ).first()
-    if not account:
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, user_id):
         raise HTTPException(status_code=404, detail="Account not found")
+    if not household_service.can_modify_account(db, account, user_id):
+        raise HTTPException(status_code=403, detail="You don't have permission to modify this account")
     if not account.is_self_managed:
         raise HTTPException(
             status_code=400,
@@ -567,11 +593,8 @@ async def list_rate_history(
     db: Session = Depends(get_db),
 ):
     """List rate history for a self-managed account (oldest first)."""
-    account = db.query(Account).filter(
-        Account.id == account_id,
-        Account.user_id == current_user.id,
-    ).first()
-    if not account:
+    account = db.query(Account).filter(Account.id == account_id).first()
+    if account is None or not household_service.can_view_account(db, account, current_user.id):
         raise HTTPException(status_code=404, detail="Account not found")
 
     from app.models.account_rate_history import AccountRateHistory
