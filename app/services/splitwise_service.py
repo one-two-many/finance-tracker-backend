@@ -77,9 +77,14 @@ class SplitwiseService:
         """
         Get list of Splitwise groups the user belongs to.
 
+        The current user is filtered out of each group's member list — they're
+        always implicitly included in any expense, and listing them would cause
+        the split UI to double-count their share.
+
         Returns:
             List of group dictionaries with id, name, and members list
         """
+        current_user_id = self.client.getCurrentUser().getId()
         groups = self.client.getGroups()
         result = []
         for group in groups:
@@ -99,6 +104,7 @@ class SplitwiseService:
                             "email": m.getEmail(),
                         }
                         for m in members
+                        if m.getId() != current_user_id
                     ],
                 }
             )
